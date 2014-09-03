@@ -12,22 +12,18 @@ stage (p(claim)*E[claim_size|claim)] estimated separately)
 import pandas as pd
 from sklearn.cross_validation import cross_val_score
 from sklearn.ensemble import AdaBoostClassifier, RandomForestClassifier
+from sklearn.ensemble import  RandomForestRegressor, AdaBoostRegressor
 import re
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model.ridge import RidgeCV
 from sklearn.linear_model import LogisticRegression, Lasso
 from sklearn.linear_model import Ridge
-from sklearn.tree import DecisionTreeClassifier
+from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
+from sklearn import svm
 import numpy as np
 import time
 import statsmodels as sm
 from scipy.optimize import minimize
-import pybrain as pyb
-from pybrain.tools.shortcuts import buildNetwork
-from pybrain.datasets import SupervisedDataSet
-from pybrain.supervised.trainers import BackpropTrainer
-from pybrain import ModuleMesh, LinearLayer, TanhLayer, SigmoidLayer
-
 from __future__ import division
 
 def weighted_gini(act,pred,weight):
@@ -132,9 +128,9 @@ def z_score_allsamps(var, var_nm):
         samp[var_nm] = (samp[var] - var_mean)/var_std
 
 # create a final submission    
-def write_submission(clf, sub_nm):
-    submission= pd.DataFrame(fire_test.id)
-    submission['target'] = fire_test[clf]
+def write_submission(clf, sub_nm, data):
+    submission= pd.DataFrame(data.id)
+    submission['target'] = data[clf]
     submission.to_csv(kaggle_pth + data_pth + sub_nm, index=False)
     
 def check_weight(coef_array):    
@@ -160,14 +156,13 @@ fire_train = pd.read_csv(kaggle_pth + data_pth + "Raw/train.csv")
 fire_test = pd.read_csv(kaggle_pth + data_pth + "Raw/test.csv")
 train_obs = len(fire_train.target)
 # Down sample zero cost policies in train
-
 train_positives = pd.DataFrame(fire_train.target!=0)
 np.random.seed(18)
 train_rnd = pd.DataFrame(np.random.rand(train_obs,1))
 ones_to_keep = (train_positives.target == True)
 zeroes_to_keep = (train_positives['target'] == False) & (train_rnd[0] > .85)
-temp_storage = fire_train.ix[(ones_to_keep) | (zeroes_to_keep), :]
-fire_train_smp = pd.DataFrame(temp_storage)
+fire_train_smp = pd.DataFrame(fire_train.ix[(ones_to_keep) |
+                             (zeroes_to_keep), :])
 # Export sampled training data 
 file_name = "Raw/train (downsampled zeroes).csv"
 fire_train_smp.to_csv(kaggle_pth + data_pth + file_name)
@@ -228,9 +223,9 @@ fire_test['bin_target'] = 0
 fire_test['target'] = 0
 
 ##################### Split train and validation ###################
-for seed in range(72,73):
+for seed in range(329,350):
     np.random.seed(seed)
-    split_rate = .20
+    split_rate = .35
     rndm_vect = np.array(np.random.rand(len(fire_train_smp.target),1))
     fire_train_TRAIN_smp = fire_train_smp[rndm_vect>split_rate ]
     fire_train_VAL_smp = fire_train_smp[rndm_vect<=split_rate ]
@@ -279,6 +274,34 @@ for seed in range(72,73):
     
     # define neural features
     net_feats = ridge_feats
+    
+    # create svc data
+    z_cont_vars = []
+    for cont in cont_vars:
+        cont_nm = "z_" + cont 
+        z_score_allsamps(cont, cont_nm)
+        z_cont_vars.append(cont_nm)
+        
+    train_obs_2 = fire_train_TRAIN_smp.target.count()
+    np.random.seed(18)
+    train_rnd = pd.DataFrame(np.random.rand(train_obs_2,1))
+    train_positives = pd.DataFrame(fire_train_TRAIN_smp.target!=0)
+    ones_to_keep = (train_positives.target == True)
+    zeroes_to_keep = (train_positives.target == False) & (train_rnd[0] > .35)
+    svc_train = pd.DataFrame(fire_train_TRAIN_smp.ix[(ones_to_keep) |
+                             (zeroes_to_keep), :])
+    svc_train.target.count()
+    svc_feats = []
+    var_types_for_svc = (lassoed_weather, z_cont_vars,
+                           lassoed_geo, lassoed_crime,
+                           dum_dict['dummy_dummies'], dum_dict['var8_dummies'],
+                           dum_dict['var1_dummies'], dum_dict['var2_dummies'],
+                           dum_dict['var3_dummies'], dum_dict['var4_dummies'],
+                           dum_dict['var5_dummies'], dum_dict['var6_dummies'],
+                           dum_dict['var9_dummies'])
+    for var_type in var_types_for_svc:
+        for cols in var_type:
+            svc_feats.append(cols)
             
     ##################### Run classifiers ############################
     weights = np.array([fire_train_TRAIN_smp['var11']]).squeeze()
@@ -313,50 +336,60 @@ for seed in range(72,73):
                     fire_train_TRAIN_smp.bin_target, weights)
     write_preds_allsamps_proba(rndm_forest, "fin_forst_preds", forest_feats)
     print "It took {time} minutes to fit forest".format(time=(time.time()
-                                                              -t0)/60)
+                                                              -t0)/60)                                                    
     
     # Adaboost
     t0= time.time() 
     ada = AdaBoostClassifier(
             base_estimator=DecisionTreeClassifier(max_depth=1, max_features=20,
-                                                  min_samples_leaf=10),
+                                                  min_samples_leaf=5),
                                 n_estimators = 450, 
                                 learning_rate=.16)
     ada.fit(fire_train_TRAIN_smp[ada_feats], 
                     fire_train_TRAIN_smp.bin_target, weights)
     write_preds_allsamps_proba(ada, "fin_ada_preds", ada_feats)
     print "It took {time} minutes to fit ada".format(time=(time.time()-t0)/60)
+   
     
     # Logit
     logit = LogisticRegression()
     logit.fit(fire_train_TRAIN_smp[logit_feats], 
                     fire_train_TRAIN_smp.bin_target)
     write_preds_allsamps_proba(logit, "fin_log_preds", logit_feats)
-             
+    
+    # SVM (?)
+    t0= time.time() 
+    svc = svm.SVC(probability=True)
+    svc.fit(svc_train[svc_feats], svc_train.bin_target, svc_train.var11)
+    write_preds_allsamps_proba(svc, "fin_svc_preds", svc_feats)
+    print "It took {time} minutes to fit SVC".format(time=(time.time()-t0)/60)
+         
     # multiply binary predictions with conditional claim size predictions
     write_szpreds_allsamps('fin_forst_preds', 'size_rdg_preds', 'forst_w_size'
                             , 1)
     write_szpreds_allsamps('fin_log_preds', 'size_rdg_preds','log_w_size' , 1)
-    
+    write_szpreds_allsamps('fin_svc_preds', 'size_rdg_preds','svc_w_size' , 1)
+    write_szpreds_allsamps('fin_ada_preds', 'size_rdg_preds','ada_w_size' , 1)
     # Ensemble
     pred_nms = ["fin_rdg_preds","fin_forst_preds", "fin_ada_preds",
                 "fin_log_preds", "size_rdg_preds", 'forst_w_size',
-                'log_w_size', "fin_lass_preds", 'var13'] 
+                'log_w_size', "fin_lass_preds", 'var13',
+                'size_rdg_preds', 'svc_w_size', 'fin_svc_preds'] 
     z_pred_nms = ["z_rdg_preds","z_forst_preds", "z_ada_preds","z_log_preds",
                   "z_size_preds",'z_forst_w_size', 'z_log_w_size', 
                   "z_lass_preds",
-                  'z_var13']
+                  'z_var13', 'z_size_rdg_preds', 'z_svc_w_size', 'z_svc_preds']
                             
     # , "z_net_preds"
     for x in range(0,len(pred_nms)):             
         z_score_allsamps(pred_nms[x], z_pred_nms[x])
     
     ens_clfs = ['z_rdg_preds', 'z_forst_w_size','z_ada_preds', 'z_log_w_size'
-                ,'z_lass_preds', 'z_var13']
-    
+                , 'z_lass_preds', 'var13', 'z_svc_preds']
+    fire_train_TRAIN_smp[ens_clfs].cov()
     # this optimizer chooses optimal weights for adding the chosen models using
     # linear weights on z-scores of predictions for each model
-    optimizer = minimize(check_weight, np.array([.5, 1, 1, 1, 1, 1]),
+    optimizer = minimize(check_weight, np.array([1, 1, 1, 1,1,1,1 ]),
                          method='nelder-mead',
                          options= {'xtol':1e-1, 'disp':True})
     
@@ -364,19 +397,26 @@ for seed in range(72,73):
     
     write_ensemble(fire_train_VAL_smp, seed)
     write_ensemble(fire_test, seed)
+    ridge = RidgeCV(np.array([0.1]), store_cv_values=True, normalize=True)
+    ridge.fit(fire_train_VAL_smp[ens_clfs], fire_train_VAL_smp.target)
+       
     name = 'ens_preds' + str(object=seed) 
+    write_preds_allsamps(ridge, name, ens_clfs)
     z_name = 'z_ens_preds' + str(object=seed)
     fire_test[z_name] = (fire_test[name] - 
                          fire_test[name].mean())/fire_test[name].std()
     del fire_test[name]
     
+   
+    
     ##################### Evaluate model ##############################
     ens_preds_nm = 'ens_preds' + str(object=seed)
     models = ('z_rdg_preds', 'z_forst_preds' , 'z_forst_w_size' ,
-              'z_ada_preds',
+              'z_ada_preds', 'ada_w_size',
               'z_log_preds', 'z_log_w_size', 'z_lass_preds',
-              ens_preds_nm, 'var13') # , 'z_net_preds'
-    
+              ens_preds_nm, 'var13', 'fin_svc_preds',
+              'z_svc_w_size', 'z_size_rdg_preds') 
+  
     for mod in models:
         print mod
         normalized_weighted_gini(fire_train_VAL_smp['target'],
@@ -385,13 +425,29 @@ for seed in range(72,73):
                              
 ##################### Create cross val predictions ##########
 fire_test['ens_preds'] = 0                             
-for x in range(30,70):
+for x in range(300,337):
     nm = 'z_ens_preds' + str(object=x) 
     fire_test['ens_preds'] += fire_test[nm]                           
 
 #################### Create Submission #############################
-sub_nm = '/Submission/Initial cross validation trial 40 folds.csv'  
-write_submission('ens_preds', sub_nm)
+sub_nm = '/Submission/CV 37 folds with ridge ens.csv'  
+write_submission('ens_preds', sub_nm, fire_test)
+
+#################### Create combined submission Submission #######
+kaggle_pth = "S:\General\Training\Ongoing Professional Development\Kaggle/"
+data_pth = "Predicting fire losses with Liberty Mutual\Data/"
+PK_path = "/Raw/28-08-14 09 35 - Third stage.csv"
+PK_test = pd.read_csv(kaggle_pth + data_pth + PK_path)
+PK_test['PK_preds'] = ((PK_test['target'] - PK_test['target'].mean())
+                        /PK_test['target'].std())
+                        
+merged_test = pd.merge(fire_test,PK_test, on='id')
+merged_test[['ens_preds', 'PK_preds']].corr()
+merged_test['comb_pred'] = 3*merged_test['ens_preds'] + merged_test['PK_preds'] 
+sub_nm = '/Submission/combined methods corrected PC upweight.csv'  
+write_submission('comb_pred', sub_nm, merged_test)
+
+
 
     
 
